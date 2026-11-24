@@ -96,9 +96,10 @@ class Store:
         now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
         with self.connect() as db:
             db.execute(
-                """INSERT INTO messages(message_id,conversation_id,peer_id,direction,body,created_at,kind)
-                   VALUES(?,?,?,?,?,?,?)""",
-                (message_id, peer_id, peer_id, direction, body, now, kind),
+                """INSERT INTO messages(message_id,conversation_id,peer_id,direction,body,created_at,kind,delivery_status)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (message_id, peer_id, peer_id, direction, body, now, kind,
+                 delivery_status or ("queued" if direction == "outgoing" else "delivered")),
             )
 
     def has_message(self, message_id: str) -> bool:
