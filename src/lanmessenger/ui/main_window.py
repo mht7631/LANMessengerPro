@@ -211,11 +211,9 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event):
-        self.network.stop()
         if self.tray.isVisible():
             self.hide()
             self.tray.showMessage("LAN Messenger Pro", "The app is still running in the system tray.")
             event.ignore()
-            self.network.start()
         else:
             event.accept()
