@@ -69,7 +69,7 @@ class PinnedTlsTransport:
             .public_key(key.public_key()).serial_number(x509.random_serial_number())
             .not_valid_before(now - timedelta(minutes=1))
             .not_valid_after(now + timedelta(days=3650))
-            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
             .sign(key, hashes.SHA256())
         )
         key_path.write_bytes(key.private_bytes(
@@ -94,8 +94,10 @@ class PinnedTlsTransport:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(str(cert), str(key))
-        # Client identity is checked against the explicit pin after TLS handshake.
-        context.verify_mode = ssl.CERT_NONE
+        # Mutual TLS: only explicitly imported self-signed peer certificates are trusted.
+        context.verify_mode = ssl.CERT_OPTIONAL
+        if self.trusted_certificates:
+            context.load_verify_locations(cadata="\n".join(self.trusted_certificates.values()))
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((self.host, self.port))
@@ -130,6 +132,8 @@ class PinnedTlsTransport:
             raise ValueError("Certificate does not match the supplied fingerprint")
         self.trusted[peer_id] = normalized
         self.trusted_certificates[peer_id] = certificate_pem
+        if hasattr(self, "_server_context"):
+            self._server_context.load_verify_locations(cadata=certificate_pem)
 
     def _serve(self) -> None:
         while not self._stop.is_set():
