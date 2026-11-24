@@ -59,6 +59,7 @@ class Store:
             message_columns = {row["name"] for row in db.execute("PRAGMA table_info(messages)")}
             if "delivery_status" not in message_columns:
                 db.execute("ALTER TABLE messages ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'delivered'")
+            db.execute("UPDATE messages SET delivery_status='queued' WHERE direction='outgoing' AND delivery_status='sending'")
 
     def sync_discovered_peers(self, peers):
         now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
