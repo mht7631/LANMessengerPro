@@ -27,6 +27,7 @@ class MainWindow(QMainWindow):
         self.store, self.config = store, config
         self.save_config_cb, self.apply_theme = save_config, apply_theme
         self.current_peer = None
+        self._inflight_messages = set()
         self._contact_rows = []
         trusted = config.setdefault("trusted_peers", {})
         self.transport = PinnedTlsTransport(
@@ -144,6 +145,7 @@ class MainWindow(QMainWindow):
         self.store.sync_discovered_peers(peers)
         self.refresh_contacts()
         self.statusBar().showMessage(f"LAN discovery active • {len(peers)} peer(s) online")
+        self._dispatch_pending()
 
     def refresh_contacts(self):
         selected = self.current_peer
@@ -186,37 +188,42 @@ class MainWindow(QMainWindow):
 
     def send_current_message(self):
         if not self.current_peer:
-            QMessageBox.information(self, "Select a contact", "Select a contact first.")
+            QMessageBox.information(self, 'Select a contact', 'Select a contact first.')
             return
         body = self.message.text().strip()
         if not body:
             return
-        contact = next((c for c in self._contact_rows if c["peer_id"] == self.current_peer), None)
-        if not contact or contact["status"] != "online":
-            QMessageBox.warning(self, "Peer offline", "This contact is currently offline.")
-            return
-        if self.current_peer not in self.transport.trusted:
-            QMessageBox.warning(self, "Pairing required", "Pair this device before sending messages.")
-            return
         peer_id = self.current_peer
-        host, port = contact["address"], int(contact["tcp_port"] or 0)
-        if not port:
-            QMessageBox.warning(self, "Unavailable", "The peer has not advertised a message port yet.")
-            return
-        self.store.add_message(peer_id, "outgoing", body)
-        self._append_message("outgoing", body)
+        self.store.add_message(peer_id, 'outgoing', body, delivery_status='queued')
+        self._append_message('outgoing', body)
         self.message.clear()
-        threading.Thread(
-            target=self._send_worker, args=(host, port, peer_id, body),
-            daemon=True, name="LAN-message-send",
-        ).start()
+        self._dispatch_pending(peer_id)
 
-    def _send_worker(self, host, port, peer_id, body):
+    def _dispatch_pending(self, only_peer=None):
+        contacts = {c['peer_id']: c for c in self._contact_rows}
+        for msg in self.store.pending_messages(only_peer):
+            message_id = msg['message_id']
+            peer_id = msg['peer_id']
+            contact = contacts.get(peer_id)
+            if (message_id in self._inflight_messages or not contact
+                    or contact['status'] != 'online'
+                    or peer_id not in self.transport.trusted):
+                continue
+            host, port = contact['address'], int(contact['tcp_port'] or 0)
+            if not host or not port:
+                continue
+            self._inflight_messages.add(message_id)
+            self.store.set_delivery_status(message_id, 'sending')
+            threading.Thread(target=self._send_worker,
+                args=(host, port, peer_id, msg['body'], message_id),
+                daemon=True, name='LAN-message-send').start()
+
+    def _send_worker(self, host, port, peer_id, body, message_id):
         try:
-            self.transport.send_message(host, port, peer_id, body)
-            self.send_finished.emit(("sent", peer_id))
+            self.transport.send_message(host, port, peer_id, body, message_id=message_id)
+            self.send_finished.emit(('sent', peer_id, message_id))
         except Exception as exc:
-            self.send_finished.emit(("error", str(exc)))
+            self.send_finished.emit(('error', peer_id, message_id, str(exc)))
 
     def _on_incoming_message(self, packet):
         peer_id = packet["sender_id"]
@@ -230,11 +237,17 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("New message received")
 
     def _on_send_finished(self, result):
-        kind, detail = result
-        if kind == "sent":
-            self.statusBar().showMessage("Message delivered and acknowledged by peer")
+        kind = result[0]
+        if kind == 'sent':
+            _kind, peer_id, message_id = result
+            self._inflight_messages.discard(message_id)
+            self.store.set_delivery_status(message_id, 'delivered')
+            self.statusBar().showMessage('Message delivered and acknowledged by peer')
         else:
-            self.statusBar().showMessage(f"Send/transport error: {detail}", 10000)
+            _kind, peer_id, message_id, detail = result
+            self._inflight_messages.discard(message_id)
+            self.store.set_delivery_status(message_id, 'failed')
+            self.statusBar().showMessage(f'Queued for retry: {detail}', 10000)
 
     def open_pairing(self):
         dialog = PairingDialog(self.config["peer_id"], self.transport.fingerprint, self.transport.certificate_pem, self)
