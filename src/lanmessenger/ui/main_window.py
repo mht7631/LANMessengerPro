@@ -32,7 +32,7 @@ class MainWindow(QMainWindow):
         trusted = config.setdefault("trusted_peers", {})
         self.transport = PinnedTlsTransport(
             config["peer_id"], APP_DIR / "identity", {},
-            on_message=self.incoming_message.emit,
+            on_message=self._persist_incoming_message,
             on_error=lambda message: self.send_finished.emit(("error", message)),
         )
         self.transport.start()
@@ -225,14 +225,22 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.send_finished.emit(('error', peer_id, message_id, str(exc)))
 
+    def _persist_incoming_message(self, packet):
+        """Persist on the transport worker before it sends the protocol ACK."""
+        message_id = packet["message_id"]
+        if not self.store.has_message(message_id):
+            self.store.add_message(
+                packet["sender_id"], "incoming", packet["body"],
+                message_id=message_id,
+            )
+        self.incoming_message.emit(packet)
+
     def _on_incoming_message(self, packet):
         peer_id = packet["sender_id"]
-        message_id = packet["message_id"]
-        if self.store.has_message(message_id):
-            return
-        self.store.add_message(peer_id, "incoming", packet["body"], message_id=message_id)
         if self.current_peer == peer_id:
-            self._append_message("incoming", packet["body"])
+            self.transcript.clear()
+            for msg in self.store.messages(peer_id):
+                self._append_message(msg["direction"], msg["body"], msg["created_at"])
         self.tray.showMessage("LAN Messenger Pro", "New message received")
         self.statusBar().showMessage("New message received")
 
