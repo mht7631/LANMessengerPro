@@ -14,6 +14,7 @@ DEFAULTS = {
     "theme": "light",
     "receive_dir": str(DEFAULT_RECEIVE_DIR),
     "start_minimized": False,
+    "trusted_peers": {},
 }
 
 def load_config() -> dict:
