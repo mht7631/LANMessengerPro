@@ -32,7 +32,7 @@ class LanDiscovery:
         peer_id: str,
         display_name: str,
         on_peers: Callable[[list[Peer]], None],
-        tcp_port: int = 47778,
+        tcp_port: int = 0,
     ):
         self.peer_id = peer_id
         self.display_name = display_name
@@ -145,7 +145,7 @@ class LanDiscovery:
             peer_id = str(data["peer_id"])
             name = str(data["display_name"]).strip()[:64]
             port = int(data["tcp_port"])
-            if not peer_id or peer_id == self.peer_id or not name or not 1 <= port <= 65535:
+            if not peer_id or peer_id == self.peer_id or not name or not 0 <= port <= 65535:
                 return
         except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
             return
