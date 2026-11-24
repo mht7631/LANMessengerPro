@@ -36,7 +36,8 @@ class Store:
                 direction TEXT NOT NULL,
                 body TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                kind TEXT NOT NULL DEFAULT 'text'
+                kind TEXT NOT NULL DEFAULT 'text',
+                delivery_status TEXT NOT NULL DEFAULT 'delivered'
             );
             CREATE INDEX IF NOT EXISTS ix_messages_conversation
                 ON messages(conversation_id, created_at);
@@ -55,6 +56,9 @@ class Store:
                 db.execute("ALTER TABLE contacts ADD COLUMN address TEXT")
             if "tcp_port" not in columns:
                 db.execute("ALTER TABLE contacts ADD COLUMN tcp_port INTEGER")
+            message_columns = {row["name"] for row in db.execute("PRAGMA table_info(messages)")}
+            if "delivery_status" not in message_columns:
+                db.execute("ALTER TABLE messages ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'delivered'")
 
     def sync_discovered_peers(self, peers):
         now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -86,7 +90,7 @@ class Store:
                 (peer_id,),
             ).fetchall()
 
-    def add_message(self, peer_id: str, direction: str, body: str, kind: str = "text", message_id: str | None = None):
+    def add_message(self, peer_id: str, direction: str, body: str, kind: str = "text", message_id: str | None = None, delivery_status: str | None = None):
         import uuid
         message_id = message_id or str(uuid.uuid4())
         now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -100,3 +104,19 @@ class Store:
     def has_message(self, message_id: str) -> bool:
         with self.connect() as db:
             return db.execute("SELECT 1 FROM messages WHERE message_id=?", (message_id,)).fetchone() is not None
+
+    def set_delivery_status(self, message_id: str, status: str):
+        if status not in {"queued", "sending", "delivered", "failed"}:
+            raise ValueError("Invalid delivery status")
+        with self.connect() as db:
+            db.execute("UPDATE messages SET delivery_status=? WHERE message_id=?", (status, message_id))
+
+    def pending_messages(self, peer_id: str | None = None):
+        query = "SELECT * FROM messages WHERE direction='outgoing' AND delivery_status IN ('queued','failed')"
+        args = ()
+        if peer_id:
+            query += " AND peer_id=?"
+            args = (peer_id,)
+        query += " ORDER BY created_at"
+        with self.connect() as db:
+            return db.execute(query, args).fetchall()
