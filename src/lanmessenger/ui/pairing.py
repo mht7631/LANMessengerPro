@@ -9,12 +9,19 @@ from PySide6.QtWidgets import (
 class PairingDialog(QDialog):
     """Manual out-of-band pairing: compare fingerprints before trusting a peer."""
 
-    def __init__(self, own_fingerprint: str, own_certificate: str, parent=None):
+    def __init__(self, own_peer_id: str, own_fingerprint: str, own_certificate: str, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Pair a trusted device")
         self.setMinimumSize(650, 620)
         root = QVBoxLayout(self)
         root.addWidget(QLabel("Share your device identity with the other person using a trusted channel."))
+        self.own_id = QLineEdit(own_peer_id)
+        self.own_id.setReadOnly(True)
+        root.addWidget(QLabel("My device ID"))
+        root.addWidget(self.own_id)
+        copy_id = QPushButton("Copy my device ID")
+        copy_id.clicked.connect(lambda: QApplication.clipboard().setText(own_peer_id))
+        root.addWidget(copy_id)
         self.own_fp = QLineEdit(own_fingerprint)
         self.own_fp.setReadOnly(True)
         self.own_cert = QTextEdit()
