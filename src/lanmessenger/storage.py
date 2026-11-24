@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Iterator
 from .config import DB_PATH
 
 
@@ -12,11 +14,25 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init()
 
-    def connect(self):
-        con = sqlite3.connect(self.path)
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        """Open a short-lived connection and always release its file handle.
+
+        sqlite3.Connection's context manager commits/rolls back but does not
+        close the connection; explicit close is required on Windows so temp
+        databases can be removed and application files can be replaced.
+        """
+        con = sqlite3.connect(self.path, timeout=15)
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA foreign_keys=ON")
-        return con
+        try:
+            yield con
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
 
     def _init(self):
         with self.connect() as db:
