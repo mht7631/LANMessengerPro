@@ -86,12 +86,17 @@ class Store:
                 (peer_id,),
             ).fetchall()
 
-    def add_message(self, peer_id: str, direction: str, body: str, kind: str = "text"):
+    def add_message(self, peer_id: str, direction: str, body: str, kind: str = "text", message_id: str | None = None):
         import uuid
+        message_id = message_id or str(uuid.uuid4())
         now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
         with self.connect() as db:
             db.execute(
                 """INSERT INTO messages(message_id,conversation_id,peer_id,direction,body,created_at,kind)
                    VALUES(?,?,?,?,?,?,?)""",
-                (str(uuid.uuid4()), peer_id, peer_id, direction, body, now, kind),
+                (message_id, peer_id, peer_id, direction, body, now, kind),
             )
+
+    def has_message(self, message_id: str) -> bool:
+        with self.connect() as db:
+            return db.execute("SELECT 1 FROM messages WHERE message_id=?", (message_id,)).fetchone() is not None
