@@ -53,6 +53,7 @@ class PinnedTlsTransport:
         self._thread: threading.Thread | None = None
         self._send_lock = threading.Lock()
         self.fingerprint = ""
+        self.certificate_pem = ""
 
     def _identity(self) -> tuple[Path, Path]:
         self.cert_dir.mkdir(parents=True, exist_ok=True)
@@ -89,12 +90,13 @@ class PinnedTlsTransport:
         cert, key = self._identity()
         der = ssl.PEM_cert_to_DER_cert(cert.read_text(encoding="ascii"))
         self.fingerprint = hashlib.sha256(der).hexdigest()
+        self.certificate_pem = cert.read_text(encoding="ascii")
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(str(cert), str(key))
         # Request client certificates and trust only explicitly paired self-signed identities.
+        context.verify_mode = ssl.CERT_OPTIONAL
         if self.trusted_certificates:
-            context.verify_mode = ssl.CERT_OPTIONAL
             context.load_verify_locations(cadata="\n".join(self.trusted_certificates.values()))
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
