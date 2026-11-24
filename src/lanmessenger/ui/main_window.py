@@ -1,20 +1,26 @@
 from pathlib import Path
+import threading
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QFrame, QLabel, QListWidget,
     QListWidgetItem, QLineEdit, QPushButton, QTextEdit, QToolBar, QSplitter,
-    QSystemTrayIcon, QMenu, QMessageBox, QFileDialog, QApplication, QDialog
+    QSystemTrayIcon, QMenu, QMessageBox, QApplication, QDialog
 )
 
+from ..config import APP_DIR
 from ..network import LanDiscovery
+from ..transport import PinnedTlsTransport, PairingRequired
 from .dialogs import SettingsDialog
 from .history import HistoryViewer
+from .pairing import PairingDialog
 
 
 class MainWindow(QMainWindow):
     peers_updated = Signal(object)
+    incoming_message = Signal(object)
+    send_finished = Signal(object)
 
     def __init__(self, store, config, save_config, apply_theme):
         super().__init__()
@@ -22,25 +28,41 @@ class MainWindow(QMainWindow):
         self.save_config_cb, self.apply_theme = save_config, apply_theme
         self.current_peer = None
         self._contact_rows = []
+        trusted = config.setdefault("trusted_peers", {})
+        self.transport = PinnedTlsTransport(
+            config["peer_id"], APP_DIR / "identity", {},
+            on_message=self.incoming_message.emit,
+            on_error=lambda message: self.send_finished.emit(("error", message)),
+        )
+        self.transport.start()
+        for peer_id, data in trusted.items():
+            try:
+                self.transport.trust_peer(peer_id, data["fingerprint"], data["certificate"])
+            except (KeyError, TypeError, ValueError):
+                continue
         self.network = LanDiscovery(
             peer_id=config["peer_id"],
             display_name=config["display_name"],
             on_peers=self.peers_updated.emit,
+            tcp_port=self.transport.port,
         )
         self.peers_updated.connect(self._on_peers_updated)
+        self.incoming_message.connect(self._on_incoming_message)
+        self.send_finished.connect(self._on_send_finished)
         self.setWindowTitle("LAN Messenger Pro")
         self.resize(1050, 690)
         self._build_ui()
         self._build_tray()
         self.refresh_contacts()
         self.network.start()
-        self.statusBar().showMessage("LAN discovery active • Waiting for peers on this network")
+        self.statusBar().showMessage("LAN discovery and TLS listener active")
 
     def _build_ui(self):
         toolbar = QToolBar("Main")
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
         for label, callback in [
+            ("Pair device", self.open_pairing),
             ("My Info", self.open_settings),
             ("History", self.open_history),
             ("Settings", self.open_settings),
@@ -83,7 +105,7 @@ class MainWindow(QMainWindow):
         self.chat_title = QLabel("Select a contact")
         self.chat_title.setStyleSheet("font-size: 15pt; font-weight: 650;")
         chat_layout.addWidget(self.chat_title)
-        self.chat_subtitle = QLabel("Peer-to-peer discovery • Messaging transport is the next milestone")
+        self.chat_subtitle = QLabel("TLS encrypted transport • Pair devices to start chatting")
         self.chat_subtitle.setObjectName("Muted")
         chat_layout.addWidget(self.chat_subtitle)
         self.transcript = QTextEdit()
@@ -91,14 +113,11 @@ class MainWindow(QMainWindow):
         chat_layout.addWidget(self.transcript, 1)
         composer = QHBoxLayout()
         self.message = QLineEdit()
-        self.message.setPlaceholderText("Messaging will activate in the next network milestone…")
-        self.message.setEnabled(False)
-        send_file = QPushButton("Attach")
-        send_file.setEnabled(False)
+        self.message.setPlaceholderText("Write a message…")
+        self.message.returnPressed.connect(self.send_current_message)
         send = QPushButton("Send")
         send.setObjectName("Primary")
-        send.setEnabled(False)
-        composer.addWidget(send_file)
+        send.clicked.connect(self.send_current_message)
         composer.addWidget(self.message, 1)
         composer.addWidget(send)
         chat_layout.addLayout(composer)
@@ -124,10 +143,7 @@ class MainWindow(QMainWindow):
     def _on_peers_updated(self, peers):
         self.store.sync_discovered_peers(peers)
         self.refresh_contacts()
-        count = len(peers)
-        self.statusBar().showMessage(
-            f"LAN discovery active • {count} peer(s) online"
-        )
+        self.statusBar().showMessage(f"LAN discovery active • {len(peers)} peer(s) online")
 
     def refresh_contacts(self):
         selected = self.current_peer
@@ -135,18 +151,15 @@ class MainWindow(QMainWindow):
         self._contact_rows = self.store.contacts()
         for contact in self._contact_rows:
             online = contact["status"] == "online"
-            marker = "🟢" if online else "⚪"
-            label = f"{marker}  {contact['display_name']}"
-            item = QListWidgetItem(label)
+            paired = contact["peer_id"] in self.transport.trusted
+            marker = "🔐" if paired and online else ("🟢" if online else "⚪")
+            item = QListWidgetItem(f"{marker}  {contact['display_name']}")
             item.setData(Qt.ItemDataRole.UserRole, contact["peer_id"])
-            item.setToolTip(
-                f"{contact['display_name']} • {contact['status']}"
-                + (f" • {contact['address']}" if contact["address"] else "")
-            )
+            item.setToolTip(f"{contact['display_name']} • {contact['status']} • {'Paired' if paired else 'Not paired'}")
             self.people.addItem(item)
             if selected and contact["peer_id"] == selected:
                 self.people.setCurrentItem(item)
-        self.my_info.setText(f"My Info  •  {self.config['display_name']}")
+        self.my_info.setText(f"My Info • {self.config['display_name']}")
 
     def filter_contacts(self, query):
         q = query.casefold()
@@ -161,7 +174,7 @@ class MainWindow(QMainWindow):
         for msg in self.store.messages(self.current_peer):
             self._append_message(msg["direction"], msg["body"], msg["created_at"])
         if contact and contact["status"] == "online":
-            self.chat_subtitle.setText(f"Online • {contact['address']}")
+            self.chat_subtitle.setText(f"{'Paired' if self.current_peer in self.transport.trusted else 'Not paired'} • {contact['address']}:{contact['tcp_port']}")
         else:
             self.chat_subtitle.setText("Offline • Local history remains available")
 
@@ -169,14 +182,83 @@ class MainWindow(QMainWindow):
         prefix = "You" if direction == "outgoing" else self.chat_title.text()
         safe_body = (body.replace("&", "&amp;").replace("<", "&lt;")
                      .replace(">", "&gt;").replace("\n", "<br>"))
-        self.transcript.append(
-            f"<b>{prefix}</b> <span style='color:gray'>{timestamp}</span><br>{safe_body}<br>"
-        )
+        self.transcript.append(f"<b>{prefix}</b> <span style='color:gray'>{timestamp}</span><br>{safe_body}<br>")
 
-    def filter_contacts(self, query):
-        q = query.casefold()
-        for i in range(self.people.count()):
-            self.people.item(i).setHidden(q not in self.people.item(i).text().casefold())
+    def send_current_message(self):
+        if not self.current_peer:
+            QMessageBox.information(self, "Select a contact", "Select a contact first.")
+            return
+        body = self.message.text().strip()
+        if not body:
+            return
+        contact = next((c for c in self._contact_rows if c["peer_id"] == self.current_peer), None)
+        if not contact or contact["status"] != "online":
+            QMessageBox.warning(self, "Peer offline", "This contact is currently offline.")
+            return
+        if self.current_peer not in self.transport.trusted:
+            QMessageBox.warning(self, "Pairing required", "Pair this device before sending messages.")
+            return
+        peer_id = self.current_peer
+        host, port = contact["address"], int(contact["tcp_port"] or 0)
+        if not port:
+            QMessageBox.warning(self, "Unavailable", "The peer has not advertised a message port yet.")
+            return
+        self.store.add_message(peer_id, "outgoing", body)
+        self._append_message("outgoing", body)
+        self.message.clear()
+        threading.Thread(
+            target=self._send_worker, args=(host, port, peer_id, body),
+            daemon=True, name="LAN-message-send",
+        ).start()
+
+    def _send_worker(self, host, port, peer_id, body):
+        try:
+            self.transport.send_message(host, port, peer_id, body)
+            self.send_finished.emit(("sent", peer_id))
+        except Exception as exc:
+            self.send_finished.emit(("error", str(exc)))
+
+    def _on_incoming_message(self, packet):
+        peer_id = packet["sender_id"]
+        message_id = packet["message_id"]
+        if self.store.has_message(message_id):
+            return
+        self.store.add_message(peer_id, "incoming", packet["body"], message_id=message_id)
+        if self.current_peer == peer_id:
+            self._append_message("incoming", packet["body"])
+        self.tray.showMessage("LAN Messenger Pro", "New message received")
+        self.statusBar().showMessage("New message received")
+
+    def _on_send_finished(self, result):
+        kind, detail = result
+        if kind == "sent":
+            self.statusBar().showMessage("Message delivered and acknowledged by peer")
+        else:
+            self.statusBar().showMessage(f"Send/transport error: {detail}", 10000)
+
+    def open_pairing(self):
+        dialog = PairingDialog(self.transport.fingerprint, self.transport.certificate_pem, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        peer_id = values["peer_id"]
+        if not peer_id or not values["host"]:
+            QMessageBox.warning(self, "Pairing", "Device ID and IP address are required.")
+            return
+        try:
+            self.transport.trust_peer(peer_id, values["fingerprint"], values["certificate"])
+        except ValueError as exc:
+            QMessageBox.warning(self, "Pairing failed", str(exc))
+            return
+        self.config.setdefault("trusted_peers", {})[peer_id] = {
+            "fingerprint": values["fingerprint"].replace(":", "").lower(),
+            "certificate": values["certificate"],
+            "host": values["host"],
+            "port": values["port"],
+        }
+        self.save_config_cb(self.config)
+        self.refresh_contacts()
+        QMessageBox.information(self, "Device paired", "The certificate fingerprint was verified and this device is now trusted. The other user must also pair your device.")
 
     def contact_menu(self, point):
         item = self.people.itemAt(point)
@@ -184,8 +266,10 @@ class MainWindow(QMainWindow):
             return
         menu = QMenu(self)
         open_chat = menu.addAction("Open chat")
+        pair = menu.addAction("Pair device…")
         history = menu.addAction("View history")
         open_chat.triggered.connect(lambda: self.select_contact(item))
+        pair.triggered.connect(self.open_pairing)
         history.triggered.connect(self.open_history)
         menu.exec(self.people.mapToGlobal(point))
 
@@ -205,10 +289,7 @@ class MainWindow(QMainWindow):
         self.apply_theme(self.config["theme"])
         self.network.update_profile(self.config["display_name"])
         self.refresh_contacts()
-        QMessageBox.information(
-            self, "Settings saved",
-            "Your profile was saved. The new display name is now being advertised on the LAN."
-        )
+        QMessageBox.information(self, "Settings saved", "Your profile was saved and is being advertised on the LAN.")
 
     def closeEvent(self, event):
         if self.tray.isVisible():
@@ -217,3 +298,7 @@ class MainWindow(QMainWindow):
             event.ignore()
         else:
             event.accept()
+
+    def shutdown(self):
+        self.network.stop()
+        self.transport.stop()
