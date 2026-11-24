@@ -238,6 +238,9 @@ class MainWindow(QMainWindow):
 
     def _on_send_finished(self, result):
         kind = result[0]
+        if len(result) == 2:
+            self.statusBar().showMessage(f'Transport error: {result[1]}', 10000)
+            return
         if kind == 'sent':
             _kind, peer_id, message_id = result
             self._inflight_messages.discard(message_id)
