@@ -39,10 +39,12 @@ class PinnedTlsTransport:
         on_error: Callable[[str], None] | None = None,
         host: str = "0.0.0.0",
         port: int = 47888,
+        trusted_certificates: dict[str, str] | None = None,
     ):
         self.peer_id = peer_id
         self.cert_dir = Path(cert_dir)
         self.trusted = {k: v.replace(":", "").lower() for k, v in trusted_fingerprints.items()}
+        self.trusted_certificates = dict(trusted_certificates or {})
         self.on_message = on_message
         self.on_error = on_error or (lambda _message: None)
         self.host, self.port = host, port
@@ -90,6 +92,10 @@ class PinnedTlsTransport:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(str(cert), str(key))
+        # Request client certificates and trust only explicitly paired self-signed identities.
+        if self.trusted_certificates:
+            context.verify_mode = ssl.CERT_OPTIONAL
+            context.load_verify_locations(cadata="\n".join(self.trusted_certificates.values()))
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((self.host, self.port))
@@ -112,11 +118,18 @@ class PinnedTlsTransport:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
 
-    def trust_peer(self, peer_id: str, fingerprint: str) -> None:
+    def trust_peer(self, peer_id: str, fingerprint: str, certificate_pem: str) -> None:
         normalized = fingerprint.replace(":", "").lower()
         if len(normalized) != 64 or any(c not in "0123456789abcdef" for c in normalized):
             raise ValueError("A SHA-256 certificate fingerprint (64 hex characters) is required")
+        try:
+            der = ssl.PEM_cert_to_DER_cert(certificate_pem)
+        except (ValueError, ssl.SSLError) as exc:
+            raise ValueError("A valid PEM certificate is required") from exc
+        if hashlib.sha256(der).hexdigest() != normalized:
+            raise ValueError("Certificate does not match the supplied fingerprint")
         self.trusted[peer_id] = normalized
+        self.trusted_certificates[peer_id] = certificate_pem
 
     def _serve(self) -> None:
         while not self._stop.is_set():
@@ -190,6 +203,8 @@ class PinnedTlsTransport:
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
+        cert_path, key_path = self._identity()
+        context.load_cert_chain(str(cert_path), str(key_path))
         with self._send_lock:
             with socket.create_connection((host, port), timeout=CONNECT_TIMEOUT) as raw:
                 with context.wrap_socket(raw, server_hostname=peer_id) as conn:
