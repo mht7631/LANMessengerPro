@@ -154,7 +154,12 @@ class PinnedTlsTransport:
                 if request.get("type") != "message":
                     return
                 sender = str(request.get("sender_id", ""))
-                if not sender or self.trusted.get(sender) != actual:
+                try:
+                    peer_cert = x509.load_der_x509_certificate(cert)
+                    certificate_peer_id = peer_cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+                except (ValueError, IndexError):
+                    return
+                if not sender or certificate_peer_id != sender or self.trusted.get(sender) != actual:
                     response = {"type": "error", "error": "pairing_required"}
                     self._write_frame(stream, response)
                     return
