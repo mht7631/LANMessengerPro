@@ -203,11 +203,11 @@ class PinnedTlsTransport:
         stream.write(raw)
         stream.flush()
 
-    def send_message(self, host: str, port: int, peer_id: str, body: str) -> str:
+    def send_message(self, host: str, port: int, peer_id: str, body: str, message_id: str | None = None) -> str:
         expected = self.trusted.get(peer_id)
         if not expected:
             raise PairingRequired(f"Peer {peer_id} has not been paired")
-        message_id = str(uuid.uuid4())
+        message_id = message_id or str(uuid.uuid4())
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.check_hostname = False
