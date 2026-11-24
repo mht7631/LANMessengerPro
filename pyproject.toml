@@ -7,7 +7,7 @@ name = "lan-messenger-pro"
 version = "0.2.0.dev1"
 description = "Modern classic-style LAN messenger desktop client"
 requires-python = ">=3.11"
-dependencies = ["PySide6>=6.8,<7", "SQLAlchemy>=2.0,<3"]
+dependencies = ["PySide6>=6.8,<7", "SQLAlchemy>=2.0,<3", "cryptography>=44,<47"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
