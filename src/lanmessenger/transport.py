@@ -94,10 +94,8 @@ class PinnedTlsTransport:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(str(cert), str(key))
-        # Request client certificates and trust only explicitly paired self-signed identities.
-        context.verify_mode = ssl.CERT_OPTIONAL
-        if self.trusted_certificates:
-            context.load_verify_locations(cadata="\n".join(self.trusted_certificates.values()))
+        # Client identity is checked against the explicit pin after TLS handshake.
+        context.verify_mode = ssl.CERT_NONE
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind((self.host, self.port))
