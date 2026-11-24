@@ -27,7 +27,7 @@ def main():
 
     apply_theme(config.get("theme", "light"))
     window = MainWindow(store, config, save_config, apply_theme)
-    app.aboutToQuit.connect(window.network.stop)
+    app.aboutToQuit.connect(window.shutdown)
     if config.get("start_minimized"):
         window.hide()
     else:
