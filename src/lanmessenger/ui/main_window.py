@@ -237,7 +237,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Send/transport error: {detail}", 10000)
 
     def open_pairing(self):
-        dialog = PairingDialog(self.transport.fingerprint, self.transport.certificate_pem, self)
+        dialog = PairingDialog(self.config["peer_id"], self.transport.fingerprint, self.transport.certificate_pem, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         values = dialog.values()
