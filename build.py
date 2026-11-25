@@ -11,6 +11,6 @@ cmd = [
     "--output-dir=dist",
     "--output-filename=LANMessenger.exe",
     "--include-package=lanmessenger",
-    "src/lanmessenger/__main__.py",
+    "src/lanmessenger_launcher.py",
 ]
 raise SystemExit(subprocess.call(cmd))
