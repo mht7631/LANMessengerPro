@@ -139,8 +139,12 @@ class PinnedTlsTransport:
             raise ValueError("A SHA-256 certificate fingerprint (64 hex characters) is required")
         try:
             der = ssl.PEM_cert_to_DER_cert(certificate_pem)
-        except (ValueError, ssl.SSLError) as exc:
-            raise ValueError("A valid PEM certificate is required") from exc
+            parsed = x509.load_pem_x509_certificate(certificate_pem.encode("ascii"))
+            certificate_peer_id = parsed.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+        except (ValueError, UnicodeEncodeError, ssl.SSLError, IndexError) as exc:
+            raise ValueError("A valid PEM certificate with a device ID is required") from exc
+        if certificate_peer_id != peer_id:
+            raise ValueError("Certificate device ID does not match the paired peer ID")
         if hashlib.sha256(der).hexdigest() != normalized:
             raise ValueError("Certificate does not match the supplied fingerprint")
         self.trusted[peer_id] = normalized
@@ -310,10 +314,17 @@ class PinnedTlsTransport:
         raw = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
         try:
             conn = self._client_context().wrap_socket(raw, server_hostname=peer_id)
-            actual = hashlib.sha256(conn.getpeercert(binary_form=True)).hexdigest()
-            if actual != expected:
+            peer_der = conn.getpeercert(binary_form=True)
+            actual = hashlib.sha256(peer_der).hexdigest()
+            try:
+                peer_certificate = x509.load_der_x509_certificate(peer_der)
+                certificate_peer_id = peer_certificate.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+            except (ValueError, IndexError) as exc:
                 conn.close()
-                raise ssl.SSLError("Peer certificate fingerprint mismatch")
+                raise ssl.SSLError("Peer certificate has no valid device identity") from exc
+            if actual != expected or certificate_peer_id != peer_id:
+                conn.close()
+                raise ssl.SSLError("Peer certificate fingerprint or device identity mismatch")
             conn.settimeout(TRANSFER_TIMEOUT)
             return conn
         except Exception:
