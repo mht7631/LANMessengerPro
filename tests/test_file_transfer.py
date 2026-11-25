@@ -6,7 +6,7 @@ from pathlib import Path
 
 from lanmessenger.file_transfer import (
     FileEntry, TransferLimits, build_manifest, receive_file, send_file,
-    validate_relative_path,
+    validate_relative_path, peer_folder_name,
 )
 
 
@@ -77,6 +77,15 @@ class FileTransferSafetyTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 build_manifest(root, TransferLimits(max_file_bytes=1))
 
+
+    def test_peer_identifier_never_becomes_a_filesystem_path(self):
+        unsafe = "../../outside/../../folder"
+        result = peer_folder_name(unsafe)
+        self.assertEqual(len(result), 20)
+        self.assertTrue(all(ch in "0123456789abcdef" for ch in result))
+        self.assertEqual(result, peer_folder_name(unsafe))
+        with self.assertRaises(ValueError):
+            peer_folder_name("")
 
 if __name__ == "__main__":
     unittest.main()
