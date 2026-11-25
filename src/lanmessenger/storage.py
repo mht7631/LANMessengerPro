@@ -138,3 +138,29 @@ class Store:
         query += " ORDER BY created_at"
         with self.connect() as db:
             return db.execute(query, args).fetchall()
+
+    def add_transfer(self, transfer_id: str, peer_id: str, filename: str, size_bytes: int, direction: str, status: str):
+        if direction not in {"incoming", "outgoing"}:
+            raise ValueError("Invalid transfer direction")
+        if status not in {"pending", "completed", "failed", "rejected"}:
+            raise ValueError("Invalid transfer status")
+        now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+        with self.connect() as db:
+            db.execute(
+                """INSERT INTO transfers(transfer_id,peer_id,filename,size_bytes,direction,status,created_at)
+                   VALUES(?,?,?,?,?,?,?)
+                   ON CONFLICT(transfer_id) DO UPDATE SET
+                     status=excluded.status,
+                     size_bytes=excluded.size_bytes""",
+                (transfer_id, peer_id, filename, max(0, int(size_bytes)), direction, status, now),
+            )
+
+    def transfers(self, peer_id: str | None = None):
+        query = "SELECT * FROM transfers"
+        args = ()
+        if peer_id:
+            query += " WHERE peer_id=?"
+            args = (peer_id,)
+        query += " ORDER BY created_at DESC"
+        with self.connect() as db:
+            return db.execute(query, args).fetchall()
