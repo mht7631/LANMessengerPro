@@ -30,6 +30,7 @@ class MainWindow(QMainWindow):
         self.save_config_cb, self.apply_theme = save_config, apply_theme
         self.current_peer = None
         self._inflight_messages = set()
+        self._accepted_folder_transfers = set()
         self._contact_rows = []
         trusted = config.setdefault("trusted_peers", {})
         self.transport = PinnedTlsTransport(
@@ -124,10 +125,13 @@ class MainWindow(QMainWindow):
         self.message.returnPressed.connect(self.send_current_message)
         attach = QPushButton("Attach file…")
         attach.clicked.connect(self.send_file_dialog)
+        attach_folder = QPushButton("Attach folder…")
+        attach_folder.clicked.connect(self.send_folder_dialog)
         send = QPushButton("Send")
         send.setObjectName("Primary")
         send.clicked.connect(self.send_current_message)
         composer.addWidget(attach)
+        composer.addWidget(attach_folder)
         composer.addWidget(self.message, 1)
         composer.addWidget(send)
         chat_layout.addLayout(composer)
@@ -264,7 +268,40 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.send_finished.emit(("file_error", peer_id, str(exc)))
 
+    def send_folder_dialog(self):
+        if not self.current_peer:
+            QMessageBox.information(self, "Select a contact", "Select a contact first.")
+            return
+        contact = next((c for c in self._contact_rows if c["peer_id"] == self.current_peer), None)
+        if not contact or contact["status"] != "online":
+            QMessageBox.information(self, "Peer offline", "Folder transfer requires the recipient to be online.")
+            return
+        if self.current_peer not in self.transport.trusted:
+            QMessageBox.information(self, "Pairing required", "Pair this device before sending folders.")
+            return
+        folder = QFileDialog.getExistingDirectory(self, "Send a folder")
+        if not folder:
+            return
+        path = Path(folder)
+        self.statusBar().showMessage(f"Preparing folder {path.name}…")
+        threading.Thread(
+            target=self._send_folder_worker,
+            args=(contact["address"], int(contact["tcp_port"] or 0), self.current_peer, path),
+            daemon=True,
+            name="LAN-folder-send",
+        ).start()
+
+    def _send_folder_worker(self, host, port, peer_id, folder):
+        try:
+            folder_id, count, total_bytes = self.transport.send_folder(host, port, peer_id, folder)
+            self.send_finished.emit(("folder_sent", peer_id, folder_id, folder.name, count, total_bytes))
+        except Exception as exc:
+            self.send_finished.emit(("folder_error", peer_id, folder.name, str(exc)))
+
     def _request_file_destination(self, packet):
+        folder_id = packet.get("folder_id")
+        if folder_id and folder_id in self._accepted_folder_transfers:
+            return Path(self.config["receive_dir"]) / packet["sender_id"] / packet["folder_name"]
         event = threading.Event()
         response = {}
         self.file_offer_requested.emit({"packet": packet, "event": event, "response": response})
@@ -277,24 +314,40 @@ class MainWindow(QMainWindow):
         contact = next((c for c in self._contact_rows if c["peer_id"] == packet["sender_id"]), None)
         sender = contact["display_name"] if contact else packet["sender_id"]
         size_mb = packet["size"] / (1024 * 1024)
+        folder_id = packet.get("folder_id")
+        if folder_id:
+            description = (
+                f"{sender} wants to send folder '{packet['folder_name']}' "
+                f"({packet['folder_count']} files, {packet['folder_total_bytes'] / (1024 * 1024):.2f} MB).\n"
+                f"First file: {packet['relative_path']} ({size_mb:.2f} MB).\n\nAccept this folder?"
+            )
+        else:
+            description = f"{sender} wants to send {packet['filename']} ({size_mb:.2f} MB).\n\nAccept this file?"
         answer = QMessageBox.question(
-            self,
-            "Incoming file",
-            f"{sender} wants to send {packet['filename']} ({size_mb:.2f} MB).\n\nAccept this file?",
+            self, "Incoming transfer", description,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if answer == QMessageBox.StandardButton.Yes:
             root = Path(self.config["receive_dir"]) / packet["sender_id"]
+            if folder_id:
+                root = root / packet["folder_name"]
+                self._accepted_folder_transfers.add(folder_id)
             root.mkdir(parents=True, exist_ok=True)
             request["response"]["root"] = root
         request["event"].set()
 
     def _file_received_worker(self, packet, saved_path):
         self.store.add_transfer(
-            packet["transfer_id"], packet["sender_id"], packet["filename"],
+            packet["transfer_id"], packet["sender_id"], packet["relative_path"],
             packet["size"], "incoming", "completed",
         )
+        if packet.get("folder_id") and packet["folder_index"] == packet["folder_count"]:
+            self.store.add_transfer(
+                packet["folder_id"], packet["sender_id"], packet["folder_name"],
+                packet["folder_total_bytes"], "incoming", "completed",
+            )
+            self._accepted_folder_transfers.discard(packet["folder_id"])
         self.file_received.emit({"packet": packet, "path": saved_path})
 
     def _on_file_received(self, result):
@@ -323,6 +376,14 @@ class MainWindow(QMainWindow):
 
     def _on_send_finished(self, result):
         kind = result[0]
+        if kind == "folder_sent":
+            _kind, peer_id, folder_id, folder_name, count, total_bytes = result
+            self.store.add_transfer(folder_id, peer_id, folder_name, total_bytes, "outgoing", "completed")
+            self.statusBar().showMessage(f"Folder sent and verified: {folder_name} ({count} files)", 12000)
+            return
+        if kind == "folder_error":
+            self.statusBar().showMessage(f"Folder transfer failed: {result[2]} — {result[3]}", 12000)
+            return
         if kind == "file_sent":
             _kind, peer_id, transfer_id, filename, size = result
             self.store.add_transfer(transfer_id, peer_id, filename, size, "outgoing", "completed")
