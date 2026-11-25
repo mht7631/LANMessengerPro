@@ -28,5 +28,15 @@ class OutboxTests(unittest.TestCase):
             self.assertEqual(store.messages("peer-1")[0]["delivery_status"], "delivered")
 
 
+    def test_transfer_history_is_persisted_per_peer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "test.db")
+            store.add_transfer("transfer-1", "peer-1", "report.pdf", 1234, "incoming", "completed")
+            rows = store.transfers("peer-1")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["filename"], "report.pdf")
+            self.assertEqual(rows[0]["status"], "completed")
+            self.assertEqual(store.transfers("peer-2"), [])
+
 if __name__ == "__main__":
     unittest.main()
