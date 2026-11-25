@@ -30,7 +30,7 @@ class SettingsDialog(QDialog):
         form.addRow("Received files folder", folder_row)
         form.addRow("", self.start_min)
         root.addLayout(form)
-        note = QCheckBox("I understand display-name changes will be shared with peers once LAN sync is implemented.")
+        note = QCheckBox("Display-name changes are announced to peers on the LAN.")
         note.setChecked(True)
         note.setEnabled(False)
         root.addWidget(note)
