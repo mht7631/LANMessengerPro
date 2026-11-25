@@ -103,5 +103,41 @@ class TransportIdentityTests(unittest.TestCase):
             a.stop()
             b.stop()
 
+    def test_paired_tls_folder_transfer_preserves_tree_and_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "Project Docs"
+            (source / "nested").mkdir(parents=True)
+            (source / "one.txt").write_text("first")
+            (source / "nested" / "two.txt").write_text("second file")
+            receive_root = root / "received"
+            completed = []
+            final_received = Event()
+
+            def on_file_received(packet, path):
+                completed.append((packet, path))
+                if packet.get("folder_index") == packet.get("folder_count"):
+                    final_received.set()
+
+            a = PinnedTlsTransport("device-a", root / "a", {}, lambda _msg: None, port=0)
+            b = PinnedTlsTransport(
+                "device-b", root / "b", {}, lambda _msg: None, port=0,
+                on_file_offer=lambda packet: receive_root / packet["folder_name"],
+                on_file_received=on_file_received,
+            )
+            a.start()
+            b.start()
+            a.trust_peer("device-b", b.fingerprint, b.certificate_pem)
+            b.trust_peer("device-a", a.fingerprint, a.certificate_pem)
+            folder_id, count, total_bytes = a.send_folder("127.0.0.1", b.port, "device-b", source)
+            self.assertTrue(final_received.wait(5))
+            self.assertEqual(count, 2)
+            self.assertEqual(total_bytes, len(b"first") + len(b"second file"))
+            self.assertEqual((receive_root / "Project Docs" / "one.txt").read_text(), "first")
+            self.assertEqual((receive_root / "Project Docs" / "nested" / "two.txt").read_text(), "second file")
+            self.assertEqual(completed[-1][0]["folder_id"], folder_id)
+            a.stop()
+            b.stop()
+
 if __name__ == "__main__":
     unittest.main()
