@@ -1,4 +1,5 @@
 from pathlib import Path
+import hashlib
 import threading
 
 from PySide6.QtCore import Qt, Signal
@@ -298,10 +299,15 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.send_finished.emit(("folder_error", peer_id, folder.name, str(exc)))
 
+    def _sender_receive_root(self, sender_id):
+        # Hash the peer identifier so a manually paired ID cannot become a path component.
+        safe_peer_folder = hashlib.sha256(str(sender_id).encode("utf-8")).hexdigest()[:20]
+        return Path(self.config["receive_dir"]) / safe_peer_folder
+
     def _request_file_destination(self, packet):
         folder_id = packet.get("folder_id")
         if folder_id and folder_id in self._accepted_folder_transfers:
-            return Path(self.config["receive_dir"]) / packet["sender_id"] / packet["folder_name"]
+            return self._sender_receive_root(packet["sender_id"]) / packet["folder_name"]
         event = threading.Event()
         response = {}
         self.file_offer_requested.emit({"packet": packet, "event": event, "response": response})
@@ -329,7 +335,7 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.No,
         )
         if answer == QMessageBox.StandardButton.Yes:
-            root = Path(self.config["receive_dir"]) / packet["sender_id"]
+            root = self._sender_receive_root(packet["sender_id"])
             if folder_id:
                 root = root / packet["folder_name"]
                 self._accepted_folder_transfers.add(folder_id)
