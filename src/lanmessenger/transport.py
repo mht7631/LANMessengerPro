@@ -19,6 +19,7 @@ from .file_transfer import CHUNK_SIZE, FileEntry, TransferLimits, receive_file, 
 
 MAX_FRAME = 64 * 1024
 CONNECT_TIMEOUT = 5.0
+TRANSFER_TIMEOUT = 600.0
 
 
 class PairingRequired(ConnectionError):
@@ -157,7 +158,7 @@ class PinnedTlsTransport:
 
     def _handle(self, raw: socket.socket, address) -> None:
         try:
-            raw.settimeout(60.0)
+            raw.settimeout(10.0)
             with self._server_context.wrap_socket(raw, server_side=True) as conn:
                 cert = conn.getpeercert(binary_form=True)
                 if not cert:
@@ -190,6 +191,7 @@ class PinnedTlsTransport:
                     return
 
                 if request_type == "file":
+                    conn.settimeout(TRANSFER_TIMEOUT)
                     self._receive_file(stream, request, sender)
                     return
                 self._write_frame(stream, {"type": "error", "error": "unsupported_type"})
@@ -267,6 +269,7 @@ class PinnedTlsTransport:
             if actual != expected:
                 conn.close()
                 raise ssl.SSLError("Peer certificate fingerprint mismatch")
+            conn.settimeout(TRANSFER_TIMEOUT)
             return conn
         except Exception:
             raw.close()
