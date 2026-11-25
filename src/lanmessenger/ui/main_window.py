@@ -1,5 +1,4 @@
 from pathlib import Path
-import hashlib
 import threading
 
 from PySide6.QtCore import Qt, Signal
@@ -11,6 +10,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import APP_DIR
+from ..file_transfer import peer_folder_name
 from ..network import LanDiscovery
 from ..transport import PinnedTlsTransport, PairingRequired
 from .dialogs import SettingsDialog
@@ -301,8 +301,7 @@ class MainWindow(QMainWindow):
 
     def _sender_receive_root(self, sender_id):
         # Hash the peer identifier so a manually paired ID cannot become a path component.
-        safe_peer_folder = hashlib.sha256(str(sender_id).encode("utf-8")).hexdigest()[:20]
-        return Path(self.config["receive_dir"]) / safe_peer_folder
+        return Path(self.config["receive_dir"]) / peer_folder_name(str(sender_id))
 
     def _request_file_destination(self, packet):
         folder_id = packet.get("folder_id")
