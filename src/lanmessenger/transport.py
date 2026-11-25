@@ -263,12 +263,12 @@ class PinnedTlsTransport:
             self._write_frame(stream, {"type": "ready", "transfer_id": transfer_id})
             entry = FileEntry(relative.as_posix(), size, digest)
             saved_path = receive_file(stream, Path(destination_root), entry, limits=limits)
-            self._write_frame(stream, {"type": "file_ack", "transfer_id": transfer_id})
             if folder_id is not None and folder_index == folder_count:
                 with self._folder_lock:
                     session = self._folder_sessions.pop((sender, folder_id), None)
                 if not session or session["size"] != total_bytes or len(session["received"]) != folder_count:
                     raise ValueError("folder transfer completed with an incomplete manifest")
+            self._write_frame(stream, {"type": "file_ack", "transfer_id": transfer_id})
             self.on_file_received(packet, saved_path)
         except (ValueError, OSError, EOFError) as exc:
             if folder_id is not None:
