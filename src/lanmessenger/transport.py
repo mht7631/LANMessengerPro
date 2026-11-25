@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-from .file_transfer import CHUNK_SIZE, FileEntry, TransferLimits, receive_file, validate_relative_path
+from .file_transfer import CHUNK_SIZE, FileEntry, TransferLimits, build_manifest, receive_file, validate_relative_path
 
 MAX_FRAME = 64 * 1024
 CONNECT_TIMEOUT = 5.0
@@ -63,6 +63,8 @@ class PinnedTlsTransport:
         self._listener: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._send_lock = threading.Lock()
+        self._folder_lock = threading.Lock()
+        self._folder_sessions: dict[tuple[str, str], dict] = {}
         self.fingerprint = ""
         self.certificate_pem = ""
 
@@ -211,24 +213,67 @@ class PinnedTlsTransport:
         if not transfer_id or not isinstance(filename, str) or not isinstance(size, int) or isinstance(size, bool):
             self._write_frame(stream, {"type": "error", "error": "invalid_manifest"})
             return
+        folder_id = request.get("folder_id")
         try:
-            safe_name = validate_relative_path(filename, max_path_chars=240)
-            if len(safe_name.parts) != 1:
-                raise ValueError("only a file name is accepted in a single-file offer")
+            relative = validate_relative_path(request.get("relative_path", filename), max_path_chars=240)
             limits = TransferLimits()
             if not 0 <= size <= limits.max_file_bytes or not isinstance(digest, str) or len(digest) != 64:
                 raise ValueError("file manifest exceeds limits or has an invalid digest")
-            packet = {"transfer_id": transfer_id, "sender_id": sender, "filename": safe_name.name, "size": size, "sha256": digest}
+            packet = {
+                "transfer_id": transfer_id, "sender_id": sender,
+                "filename": relative.name, "relative_path": relative.as_posix(),
+                "size": size, "sha256": digest,
+            }
+            if folder_id is not None:
+                if not isinstance(folder_id, str) or not folder_id:
+                    raise ValueError("invalid folder transfer identifier")
+                folder_name = validate_relative_path(request.get("folder_name", ""), max_path_chars=240)
+                if len(folder_name.parts) != 1:
+                    raise ValueError("invalid folder name")
+                folder_index, folder_count = request.get("folder_index"), request.get("folder_count")
+                total_bytes = request.get("folder_total_bytes")
+                if (not isinstance(folder_index, int) or isinstance(folder_index, bool)
+                        or not isinstance(folder_count, int) or isinstance(folder_count, bool)
+                        or not isinstance(total_bytes, int) or isinstance(total_bytes, bool)
+                        or not 1 <= folder_index <= folder_count <= limits.max_files
+                        or not 0 <= total_bytes <= limits.max_total_bytes):
+                    raise ValueError("invalid folder manifest")
+                key = (sender, folder_id)
+                with self._folder_lock:
+                    session = self._folder_sessions.setdefault(key, {
+                        "count": folder_count, "total": total_bytes, "received": set(), "size": 0,
+                    })
+                    if (session["count"] != folder_count or session["total"] != total_bytes
+                            or folder_index in session["received"] or session["size"] + size > total_bytes):
+                        raise ValueError("folder transfer manifest mismatch")
+                    session["received"].add(folder_index)
+                    session["size"] += size
+                packet.update({
+                    "folder_id": folder_id, "folder_name": folder_name.name,
+                    "folder_index": folder_index, "folder_count": folder_count,
+                    "folder_total_bytes": total_bytes,
+                })
             destination_root = self.on_file_offer(packet)
             if destination_root is None:
                 self._write_frame(stream, {"type": "rejected", "transfer_id": transfer_id})
+                if folder_id is not None:
+                    with self._folder_lock:
+                        self._folder_sessions.pop((sender, folder_id), None)
                 return
             self._write_frame(stream, {"type": "ready", "transfer_id": transfer_id})
-            entry = FileEntry(safe_name.name, size, digest)
+            entry = FileEntry(relative.as_posix(), size, digest)
             saved_path = receive_file(stream, Path(destination_root), entry, limits=limits)
             self._write_frame(stream, {"type": "file_ack", "transfer_id": transfer_id})
+            if folder_id is not None and folder_index == folder_count:
+                with self._folder_lock:
+                    session = self._folder_sessions.pop((sender, folder_id), None)
+                if not session or session["size"] != total_bytes or len(session["received"]) != folder_count:
+                    raise ValueError("folder transfer completed with an incomplete manifest")
             self.on_file_received(packet, saved_path)
         except (ValueError, OSError, EOFError) as exc:
+            if folder_id is not None:
+                with self._folder_lock:
+                    self._folder_sessions.pop((sender, folder_id), None)
             self._write_frame(stream, {"type": "error", "error": str(exc)[:300], "transfer_id": transfer_id})
 
     @staticmethod
@@ -291,8 +336,14 @@ class PinnedTlsTransport:
                     raise ConnectionError("Message was not acknowledged")
         return message_id
 
-    def send_file(self, host: str, port: int, peer_id: str, path: Path, transfer_id: str | None = None) -> str:
-        """Send one file over the already-paired TLS channel; receiver verifies size and SHA-256 before publishing."""
+    def send_file(
+        self, host: str, port: int, peer_id: str, path: Path,
+        transfer_id: str | None = None, *, relative_path: str | None = None,
+        folder_id: str | None = None, folder_name: str | None = None,
+        folder_index: int | None = None, folder_count: int | None = None,
+        folder_total_bytes: int | None = None,
+    ) -> str:
+        """Send one file over TLS; optional folder metadata preserves a validated relative path."""
         path = Path(path)
         if path.is_symlink() or not path.is_file():
             raise ValueError("source must be a regular, non-symlink file")
@@ -307,14 +358,22 @@ class PinnedTlsTransport:
         if path.stat().st_size != size:
             raise OSError("source file changed while preparing transfer")
         transfer_id = transfer_id or str(uuid.uuid4())
+        remote_path = validate_relative_path(relative_path or path.name).as_posix()
+        offer = {
+            "type": "file", "sender_id": self.peer_id,
+            "transfer_id": transfer_id, "filename": path.name,
+            "relative_path": remote_path, "size": size, "sha256": digest.hexdigest(),
+        }
+        if folder_id is not None:
+            offer.update({
+                "folder_id": folder_id, "folder_name": folder_name,
+                "folder_index": folder_index, "folder_count": folder_count,
+                "folder_total_bytes": folder_total_bytes,
+            })
         with self._send_lock:
             with self._open_peer(host, port, peer_id) as conn:
                 stream = conn.makefile("rwb")
-                self._write_frame(stream, {
-                    "type": "file", "sender_id": self.peer_id,
-                    "transfer_id": transfer_id, "filename": path.name,
-                    "size": size, "sha256": digest.hexdigest(),
-                })
+                self._write_frame(stream, offer)
                 response = self._read_frame(stream)
                 if response.get("type") == "rejected":
                     raise TransferRejected("The receiving user declined the file")
@@ -336,3 +395,20 @@ class PinnedTlsTransport:
                 if response.get("type") != "file_ack" or response.get("transfer_id") != transfer_id:
                     raise ConnectionError(response.get("error", "File transfer was not acknowledged"))
         return transfer_id
+
+    def send_folder(self, host: str, port: int, peer_id: str, folder: Path) -> tuple[str, int, int]:
+        """Send a bounded folder manifest sequentially, preserving its directory tree."""
+        folder = Path(folder).resolve(strict=True)
+        entries = build_manifest(folder)
+        if not entries:
+            raise ValueError("folder is empty")
+        total_bytes = sum(entry.size for entry in entries)
+        folder_id = str(uuid.uuid4())
+        for index, entry in enumerate(entries, start=1):
+            self.send_file(
+                host, port, peer_id, folder.joinpath(*entry.relative_path.split("/")),
+                relative_path=entry.relative_path, folder_id=folder_id,
+                folder_name=folder.name, folder_index=index,
+                folder_count=len(entries), folder_total_bytes=total_bytes,
+            )
+        return folder_id, len(entries), total_bytes
