@@ -221,6 +221,7 @@ class PinnedTlsTransport:
             if destination_root is None:
                 self._write_frame(stream, {"type": "rejected", "transfer_id": transfer_id})
                 return
+            self._write_frame(stream, {"type": "ready", "transfer_id": transfer_id})
             entry = FileEntry(safe_name.name, size, digest)
             saved_path = receive_file(stream, Path(destination_root), entry, limits=limits)
             self._write_frame(stream, {"type": "file_ack", "transfer_id": transfer_id})
@@ -311,6 +312,11 @@ class PinnedTlsTransport:
                     "transfer_id": transfer_id, "filename": path.name,
                     "size": size, "sha256": digest.hexdigest(),
                 })
+                response = self._read_frame(stream)
+                if response.get("type") == "rejected":
+                    raise TransferRejected("The receiving user declined the file")
+                if response.get("type") != "ready" or response.get("transfer_id") != transfer_id:
+                    raise ConnectionError(response.get("error", "Receiver did not accept the file offer"))
                 # The file body follows the bounded JSON manifest on the same authenticated TLS stream.
                 with path.open("rb") as source:
                     sent = 0
@@ -324,8 +330,6 @@ class PinnedTlsTransport:
                 if sent != size:
                     raise OSError("source file changed while being transferred")
                 response = self._read_frame(stream)
-                if response.get("type") == "rejected":
-                    raise TransferRejected("The receiving user declined the file")
                 if response.get("type") != "file_ack" or response.get("transfer_id") != transfer_id:
                     raise ConnectionError(response.get("error", "File transfer was not acknowledged"))
         return transfer_id
