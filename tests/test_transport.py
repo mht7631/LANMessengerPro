@@ -1,9 +1,10 @@
 import tempfile
 import unittest
 from pathlib import Path
+from pathlib import Path
 from threading import Event
 
-from lanmessenger.transport import PinnedTlsTransport, PairingRequired
+from lanmessenger.transport import PinnedTlsTransport, PairingRequired, TransferRejected
 
 
 class TransportIdentityTests(unittest.TestCase):
@@ -56,6 +57,51 @@ class TransportIdentityTests(unittest.TestCase):
             a.stop()
             b.stop()
 
+
+    def test_paired_tls_file_transfer_requires_acceptance_and_verifies_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "payload.bin"
+            payload = b"encrypted LAN file transfer" * 12000
+            source.write_bytes(payload)
+            received = root / "received"
+            offered = Event()
+            completed = []
+            a = PinnedTlsTransport("device-a", root / "a", {}, lambda _msg: None, port=0)
+            b = PinnedTlsTransport(
+                "device-b", root / "b", {}, lambda _msg: None, port=0,
+                on_file_offer=lambda _packet: received,
+                on_file_received=lambda packet, path: (completed.append((packet, path)), offered.set()),
+            )
+            a.start()
+            b.start()
+            a.trust_peer("device-b", b.fingerprint, b.certificate_pem)
+            b.trust_peer("device-a", a.fingerprint, a.certificate_pem)
+            transfer_id = a.send_file("127.0.0.1", b.port, "device-b", source)
+            self.assertTrue(offered.wait(3))
+            self.assertEqual(completed[0][0]["transfer_id"], transfer_id)
+            self.assertEqual(completed[0][1].read_bytes(), payload)
+            a.stop()
+            b.stop()
+
+    def test_paired_tls_file_transfer_can_be_declined(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "declined.txt"
+            source.write_text("do not save")
+            a = PinnedTlsTransport("device-a", root / "a", {}, lambda _msg: None, port=0)
+            b = PinnedTlsTransport(
+                "device-b", root / "b", {}, lambda _msg: None, port=0,
+                on_file_offer=lambda _packet: None,
+            )
+            a.start()
+            b.start()
+            a.trust_peer("device-b", b.fingerprint, b.certificate_pem)
+            b.trust_peer("device-a", a.fingerprint, a.certificate_pem)
+            with self.assertRaises(TransferRejected):
+                a.send_file("127.0.0.1", b.port, "device-b", source)
+            a.stop()
+            b.stop()
 
 if __name__ == "__main__":
     unittest.main()
