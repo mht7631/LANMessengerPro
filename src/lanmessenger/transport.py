@@ -6,6 +6,7 @@ import socket
 import ssl
 import threading
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -13,7 +14,8 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
-from datetime import datetime, timedelta, timezone
+
+from .file_transfer import CHUNK_SIZE, FileEntry, TransferLimits, receive_file, validate_relative_path
 
 MAX_FRAME = 64 * 1024
 CONNECT_TIMEOUT = 5.0
@@ -23,8 +25,12 @@ class PairingRequired(ConnectionError):
     """Raised when a peer's TLS certificate has not been explicitly trusted."""
 
 
+class TransferRejected(ConnectionError):
+    """Raised when a paired peer declines an incoming file."""
+
+
 class PinnedTlsTransport:
-    """TLS 1.2+ message transport with explicit SHA-256 certificate pinning.
+    """TLS 1.2+ transport with explicit SHA-256 certificate pinning.
 
     Discovery is not authentication: every TLS peer must already have a trusted
     fingerprint. Unknown certificates are rejected rather than silently trusted.
@@ -40,6 +46,8 @@ class PinnedTlsTransport:
         host: str = "0.0.0.0",
         port: int = 47888,
         trusted_certificates: dict[str, str] | None = None,
+        on_file_offer: Callable[[dict], Path | None] | None = None,
+        on_file_received: Callable[[dict, Path], None] | None = None,
     ):
         self.peer_id = peer_id
         self.cert_dir = Path(cert_dir)
@@ -47,6 +55,8 @@ class PinnedTlsTransport:
         self.trusted_certificates = dict(trusted_certificates or {})
         self.on_message = on_message
         self.on_error = on_error or (lambda _message: None)
+        self.on_file_offer = on_file_offer or (lambda _packet: None)
+        self.on_file_received = on_file_received or (lambda _packet, _path: None)
         self.host, self.port = host, port
         self._stop = threading.Event()
         self._listener: socket.socket | None = None
@@ -60,7 +70,7 @@ class PinnedTlsTransport:
         key_path, cert_path = self.cert_dir / "identity-key.pem", self.cert_dir / "identity-cert.pem"
         if key_path.exists() and cert_path.exists():
             return cert_path, key_path
-        # ECDSA P-256 provides a compact per-installation identity certificate.
+        # ECDSA P-256 gives each installation a persistent identity; private-key file ACLs protect it at rest.
         key = ec.generate_private_key(ec.SECP256R1())
         name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, self.peer_id)])
         now = datetime.now(timezone.utc)
@@ -94,7 +104,7 @@ class PinnedTlsTransport:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(str(cert), str(key))
-        # Mutual TLS: only explicitly imported self-signed peer certificates are trusted.
+        # Only imported peer certificates enter the trust store; CERT_OPTIONAL permits pairing UI to run before any peers are known.
         context.verify_mode = ssl.CERT_OPTIONAL
         if self.trusted_certificates:
             context.load_verify_locations(cadata="\n".join(self.trusted_certificates.values()))
@@ -147,7 +157,7 @@ class PinnedTlsTransport:
 
     def _handle(self, raw: socket.socket, address) -> None:
         try:
-            raw.settimeout(CONNECT_TIMEOUT)
+            raw.settimeout(60.0)
             with self._server_context.wrap_socket(raw, server_side=True) as conn:
                 cert = conn.getpeercert(binary_form=True)
                 if not cert:
@@ -155,8 +165,6 @@ class PinnedTlsTransport:
                 actual = hashlib.sha256(cert).hexdigest()
                 stream = conn.makefile("rwb")
                 request = self._read_frame(stream)
-                if request.get("type") != "message":
-                    return
                 sender = str(request.get("sender_id", ""))
                 try:
                     peer_cert = x509.load_der_x509_certificate(cert)
@@ -164,26 +172,61 @@ class PinnedTlsTransport:
                 except (ValueError, IndexError):
                     return
                 if not sender or certificate_peer_id != sender or self.trusted.get(sender) != actual:
-                    response = {"type": "error", "error": "pairing_required"}
-                    self._write_frame(stream, response)
+                    self._write_frame(stream, {"type": "error", "error": "pairing_required"})
                     return
-                body = request.get("body")
-                message_id = request.get("message_id")
-                if not isinstance(body, str) or not body or len(body.encode("utf-8")) > 48 * 1024:
+
+                request_type = request.get("type")
+                if request_type == "message":
+                    body = request.get("body")
+                    message_id = request.get("message_id")
+                    if not isinstance(body, str) or not body or len(body.encode("utf-8")) > 48 * 1024:
+                        return
+                    self.on_message({
+                        "message_id": str(message_id or uuid.uuid4()),
+                        "sender_id": sender,
+                        "body": body,
+                    })
+                    self._write_frame(stream, {"type": "ack", "message_id": message_id})
                     return
-                self.on_message({
-                    "message_id": str(message_id or uuid.uuid4()),
-                    "sender_id": sender,
-                    "body": body,
-                })
-                self._write_frame(stream, {"type": "ack", "message_id": message_id})
-        except (OSError, ssl.SSLError, ValueError, json.JSONDecodeError) as exc:
+
+                if request_type == "file":
+                    self._receive_file(stream, request, sender)
+                    return
+                self._write_frame(stream, {"type": "error", "error": "unsupported_type"})
+        except (OSError, ssl.SSLError, ValueError, json.JSONDecodeError, EOFError) as exc:
             self.on_error(str(exc))
         finally:
             try:
                 raw.close()
             except OSError:
                 pass
+
+    def _receive_file(self, stream, request: dict, sender: str) -> None:
+        transfer_id = str(request.get("transfer_id", ""))
+        filename = request.get("filename")
+        size = request.get("size")
+        digest = request.get("sha256")
+        if not transfer_id or not isinstance(filename, str) or not isinstance(size, int) or isinstance(size, bool):
+            self._write_frame(stream, {"type": "error", "error": "invalid_manifest"})
+            return
+        try:
+            safe_name = validate_relative_path(filename, max_path_chars=240)
+            if len(safe_name.parts) != 1:
+                raise ValueError("only a file name is accepted in a single-file offer")
+            limits = TransferLimits()
+            if not 0 <= size <= limits.max_file_bytes or not isinstance(digest, str) or len(digest) != 64:
+                raise ValueError("file manifest exceeds limits or has an invalid digest")
+            packet = {"transfer_id": transfer_id, "sender_id": sender, "filename": safe_name.name, "size": size, "sha256": digest}
+            destination_root = self.on_file_offer(packet)
+            if destination_root is None:
+                self._write_frame(stream, {"type": "rejected", "transfer_id": transfer_id})
+                return
+            entry = FileEntry(safe_name.name, size, digest)
+            saved_path = receive_file(stream, Path(destination_root), entry, limits=limits)
+            self._write_frame(stream, {"type": "file_ack", "transfer_id": transfer_id})
+            self.on_file_received(packet, saved_path)
+        except (ValueError, OSError, EOFError) as exc:
+            self._write_frame(stream, {"type": "error", "error": str(exc)[:300], "transfer_id": transfer_id})
 
     @staticmethod
     def _read_frame(stream) -> dict:
@@ -203,31 +246,86 @@ class PinnedTlsTransport:
         stream.write(raw)
         stream.flush()
 
-    def send_message(self, host: str, port: int, peer_id: str, body: str, message_id: str | None = None) -> str:
-        expected = self.trusted.get(peer_id)
-        if not expected:
-            raise PairingRequired(f"Peer {peer_id} has not been paired")
-        message_id = message_id or str(uuid.uuid4())
+    def _client_context(self) -> ssl.SSLContext:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
         cert_path, key_path = self._identity()
         context.load_cert_chain(str(cert_path), str(key_path))
+        return context
+
+    def _open_peer(self, host: str, port: int, peer_id: str):
+        expected = self.trusted.get(peer_id)
+        if not expected:
+            raise PairingRequired(f"Peer {peer_id} has not been paired")
+        raw = socket.create_connection((host, port), timeout=CONNECT_TIMEOUT)
+        try:
+            conn = self._client_context().wrap_socket(raw, server_hostname=peer_id)
+            actual = hashlib.sha256(conn.getpeercert(binary_form=True)).hexdigest()
+            if actual != expected:
+                conn.close()
+                raise ssl.SSLError("Peer certificate fingerprint mismatch")
+            return conn
+        except Exception:
+            raw.close()
+            raise
+
+    def send_message(self, host: str, port: int, peer_id: str, body: str, message_id: str | None = None) -> str:
+        message_id = message_id or str(uuid.uuid4())
         with self._send_lock:
-            with socket.create_connection((host, port), timeout=CONNECT_TIMEOUT) as raw:
-                with context.wrap_socket(raw, server_hostname=peer_id) as conn:
-                    actual = hashlib.sha256(conn.getpeercert(binary_form=True)).hexdigest()
-                    if actual != expected:
-                        raise ssl.SSLError("Peer certificate fingerprint mismatch")
-                    stream = conn.makefile("rwb")
-                    self._write_frame(stream, {
-                        "type": "message", "sender_id": self.peer_id,
-                        "message_id": message_id, "body": body,
-                    })
-                    response = self._read_frame(stream)
-                    if response.get("type") != "ack" or response.get("message_id") != message_id:
-                        if response.get("error") == "pairing_required":
-                            raise PairingRequired("The receiving device has not trusted this device")
-                        raise ConnectionError("Message was not acknowledged")
+            with self._open_peer(host, port, peer_id) as conn:
+                stream = conn.makefile("rwb")
+                self._write_frame(stream, {
+                    "type": "message", "sender_id": self.peer_id,
+                    "message_id": message_id, "body": body,
+                })
+                response = self._read_frame(stream)
+                if response.get("type") != "ack" or response.get("message_id") != message_id:
+                    if response.get("error") == "pairing_required":
+                        raise PairingRequired("The receiving device has not trusted this device")
+                    raise ConnectionError("Message was not acknowledged")
         return message_id
+
+    def send_file(self, host: str, port: int, peer_id: str, path: Path, transfer_id: str | None = None) -> str:
+        """Send one file over the already-paired TLS channel; receiver verifies size and SHA-256 before publishing."""
+        path = Path(path)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("source must be a regular, non-symlink file")
+        size = path.stat().st_size
+        limits = TransferLimits()
+        if size > limits.max_file_bytes:
+            raise ValueError("file exceeds per-file transfer limit")
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(CHUNK_SIZE), b""):
+                digest.update(chunk)
+        if path.stat().st_size != size:
+            raise OSError("source file changed while preparing transfer")
+        transfer_id = transfer_id or str(uuid.uuid4())
+        with self._send_lock:
+            with self._open_peer(host, port, peer_id) as conn:
+                stream = conn.makefile("rwb")
+                self._write_frame(stream, {
+                    "type": "file", "sender_id": self.peer_id,
+                    "transfer_id": transfer_id, "filename": path.name,
+                    "size": size, "sha256": digest.hexdigest(),
+                })
+                # The file body follows the bounded JSON manifest on the same authenticated TLS stream.
+                with path.open("rb") as source:
+                    sent = 0
+                    while True:
+                        chunk = source.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        stream.write(chunk)
+                        sent += len(chunk)
+                    stream.flush()
+                if sent != size:
+                    raise OSError("source file changed while being transferred")
+                response = self._read_frame(stream)
+                if response.get("type") == "rejected":
+                    raise TransferRejected("The receiving user declined the file")
+                if response.get("type") != "file_ack" or response.get("transfer_id") != transfer_id:
+                    raise ConnectionError(response.get("error", "File transfer was not acknowledged"))
+        return transfer_id
