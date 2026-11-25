@@ -1,5 +1,9 @@
-from PySide6.QtWidgets import QDialog, QHBoxLayout, QVBoxLayout, QListWidget, QTableWidget, QTableWidgetItem, QLabel, QLineEdit, QPushButton, QWidget
+from PySide6.QtWidgets import (
+    QDialog, QHBoxLayout, QVBoxLayout, QListWidget, QTableWidget,
+    QTableWidgetItem, QLabel, QLineEdit, QPushButton, QWidget, QTabWidget,
+)
 from PySide6.QtCore import Qt
+
 
 class HistoryViewer(QDialog):
     def __init__(self, store, contacts, parent=None):
@@ -11,9 +15,19 @@ class HistoryViewer(QDialog):
         layout = QHBoxLayout(self)
         self.people = QListWidget()
         self.people.setMaximumWidth(210)
+
         self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Date / Time", "Direction", "Type", "Message / File"])
+        self.table.setHorizontalHeaderLabels(["Date / Time", "Direction", "Type", "Message"])
         self.table.horizontalHeader().setStretchLastSection(True)
+
+        self.transfer_table = QTableWidget(0, 5)
+        self.transfer_table.setHorizontalHeaderLabels(["Date / Time", "Direction", "File / Folder", "Size", "Status"])
+        self.transfer_table.horizontalHeader().setStretchLastSection(True)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.table, "Messages")
+        self.tabs.addTab(self.transfer_table, "File transfers")
+
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search history…")
         right = QVBoxLayout()
@@ -22,14 +36,15 @@ class HistoryViewer(QDialog):
         top.addStretch()
         top.addWidget(self.search)
         right.addLayout(top)
-        right.addWidget(self.table)
+        right.addWidget(self.tabs)
         layout.addWidget(self.people)
         panel = QWidget()
         panel.setLayout(right)
         layout.addWidget(panel, 1)
-        for c in contacts:
-            self.people.addItem(c["display_name"])
-        self._peer_ids = [c["peer_id"] for c in contacts]
+
+        for contact in contacts:
+            self.people.addItem(contact["display_name"])
+        self._peer_ids = [contact["peer_id"] for contact in contacts]
         self.people.currentRowChanged.connect(self.load_history)
         self.search.textChanged.connect(self.filter_rows)
         if self._peer_ids:
@@ -37,18 +52,40 @@ class HistoryViewer(QDialog):
 
     def load_history(self, row):
         self.table.setRowCount(0)
+        self.transfer_table.setRowCount(0)
         if row < 0 or row >= len(self._peer_ids):
             return
-        for msg in self.store.messages(self._peer_ids[row]):
+
+        peer_id = self._peer_ids[row]
+        for message in self.store.messages(peer_id):
             r = self.table.rowCount()
             self.table.insertRow(r)
-            values = [msg["created_at"], msg["direction"].title(), msg["kind"].title(), msg["body"]]
+            values = [
+                message["created_at"], message["direction"].title(),
+                message["kind"].title(), message["body"],
+            ]
             for col, value in enumerate(values):
                 self.table.setItem(r, col, QTableWidgetItem(str(value)))
+
+        for transfer in self.store.transfers(peer_id):
+            r = self.transfer_table.rowCount()
+            self.transfer_table.insertRow(r)
+            size = int(transfer["size_bytes"])
+            size_text = f"{size / (1024 * 1024):.2f} MB" if size >= 1024 * 1024 else f"{size / 1024:.1f} KB"
+            values = [
+                transfer["created_at"], transfer["direction"].title(),
+                transfer["filename"], size_text, transfer["status"].title(),
+            ]
+            for col, value in enumerate(values):
+                self.transfer_table.setItem(r, col, QTableWidgetItem(str(value)))
         self.filter_rows(self.search.text())
 
     def filter_rows(self, query):
         q = query.casefold()
-        for r in range(self.table.rowCount()):
-            visible = any(q in (self.table.item(r, c).text().casefold() if self.table.item(r,c) else "") for c in range(4))
-            self.table.setRowHidden(r, not visible)
+        for table in (self.table, self.transfer_table):
+            for row in range(table.rowCount()):
+                visible = any(
+                    q in (table.item(row, col).text().casefold() if table.item(row, col) else "")
+                    for col in range(table.columnCount())
+                )
+                table.setRowHidden(row, not visible)
