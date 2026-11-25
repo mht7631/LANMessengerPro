@@ -28,6 +28,8 @@ class TransportIdentityTests(unittest.TestCase):
             other.start()
             with self.assertRaises(ValueError):
                 transport.trust_peer("device-b", "00" * 32, other.certificate_pem)
+            with self.assertRaises(ValueError):
+                transport.trust_peer("wrong-device-id", other.fingerprint, other.certificate_pem)
             transport.trust_peer("device-b", other.fingerprint, other.certificate_pem)
             self.assertEqual(transport.trusted["device-b"], other.fingerprint)
             other.stop()
