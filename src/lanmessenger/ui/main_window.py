@@ -6,7 +6,7 @@ from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QFrame, QLabel, QListWidget,
     QListWidgetItem, QLineEdit, QPushButton, QTextEdit, QToolBar, QSplitter,
-    QSystemTrayIcon, QMenu, QMessageBox, QApplication, QDialog
+    QSystemTrayIcon, QMenu, QMessageBox, QApplication, QDialog, QFileDialog
 )
 
 from ..config import APP_DIR
@@ -21,6 +21,8 @@ class MainWindow(QMainWindow):
     peers_updated = Signal(object)
     incoming_message = Signal(object)
     send_finished = Signal(object)
+    file_offer_requested = Signal(object)
+    file_received = Signal(object)
 
     def __init__(self, store, config, save_config, apply_theme):
         super().__init__()
@@ -34,6 +36,8 @@ class MainWindow(QMainWindow):
             config["peer_id"], APP_DIR / "identity", {},
             on_message=self._persist_incoming_message,
             on_error=lambda message: self.send_finished.emit(("error", message)),
+            on_file_offer=self._request_file_destination,
+            on_file_received=self._file_received_worker,
         )
         self.transport.start()
         for peer_id, data in trusted.items():
@@ -50,6 +54,8 @@ class MainWindow(QMainWindow):
         self.peers_updated.connect(self._on_peers_updated)
         self.incoming_message.connect(self._on_incoming_message)
         self.send_finished.connect(self._on_send_finished)
+        self.file_offer_requested.connect(self._show_file_offer)
+        self.file_received.connect(self._on_file_received)
         self.setWindowTitle("LAN Messenger Pro")
         self.resize(1050, 690)
         self._build_ui()
@@ -116,9 +122,12 @@ class MainWindow(QMainWindow):
         self.message = QLineEdit()
         self.message.setPlaceholderText("Write a message…")
         self.message.returnPressed.connect(self.send_current_message)
+        attach = QPushButton("Attach file…")
+        attach.clicked.connect(self.send_file_dialog)
         send = QPushButton("Send")
         send.setObjectName("Primary")
         send.clicked.connect(self.send_current_message)
+        composer.addWidget(attach)
         composer.addWidget(self.message, 1)
         composer.addWidget(send)
         chat_layout.addLayout(composer)
@@ -225,6 +234,74 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.send_finished.emit(('error', peer_id, message_id, str(exc)))
 
+    def send_file_dialog(self):
+        if not self.current_peer:
+            QMessageBox.information(self, "Select a contact", "Select a contact first.")
+            return
+        contact = next((c for c in self._contact_rows if c["peer_id"] == self.current_peer), None)
+        if not contact or contact["status"] != "online":
+            QMessageBox.information(self, "Peer offline", "File transfer requires the recipient to be online.")
+            return
+        if self.current_peer not in self.transport.trusted:
+            QMessageBox.information(self, "Pairing required", "Pair this device before sending files.")
+            return
+        filename, _ = QFileDialog.getOpenFileName(self, "Send a file")
+        if not filename:
+            return
+        path = Path(filename)
+        self.statusBar().showMessage(f"Sending {path.name}…")
+        threading.Thread(
+            target=self._send_file_worker,
+            args=(contact["address"], int(contact["tcp_port"] or 0), self.current_peer, path),
+            daemon=True,
+            name="LAN-file-send",
+        ).start()
+
+    def _send_file_worker(self, host, port, peer_id, path):
+        try:
+            transfer_id = self.transport.send_file(host, port, peer_id, path)
+            self.send_finished.emit(("file_sent", peer_id, transfer_id, path.name, path.stat().st_size))
+        except Exception as exc:
+            self.send_finished.emit(("file_error", peer_id, str(exc)))
+
+    def _request_file_destination(self, packet):
+        event = threading.Event()
+        response = {}
+        self.file_offer_requested.emit({"packet": packet, "event": event, "response": response})
+        if not event.wait(90):
+            return None
+        return response.get("root")
+
+    def _show_file_offer(self, request):
+        packet = request["packet"]
+        contact = next((c for c in self._contact_rows if c["peer_id"] == packet["sender_id"]), None)
+        sender = contact["display_name"] if contact else packet["sender_id"]
+        size_mb = packet["size"] / (1024 * 1024)
+        answer = QMessageBox.question(
+            self,
+            "Incoming file",
+            f"{sender} wants to send {packet['filename']} ({size_mb:.2f} MB).\n\nAccept this file?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            root = Path(self.config["receive_dir"]) / packet["sender_id"]
+            root.mkdir(parents=True, exist_ok=True)
+            request["response"]["root"] = root
+        request["event"].set()
+
+    def _file_received_worker(self, packet, saved_path):
+        self.store.add_transfer(
+            packet["transfer_id"], packet["sender_id"], packet["filename"],
+            packet["size"], "incoming", "completed",
+        )
+        self.file_received.emit({"packet": packet, "path": saved_path})
+
+    def _on_file_received(self, result):
+        packet, path = result["packet"], result["path"]
+        self.tray.showMessage("LAN Messenger Pro", f"Received {path.name}")
+        self.statusBar().showMessage(f"File received and verified: {path}", 12000)
+
     def _persist_incoming_message(self, packet):
         """Persist on the transport worker before it sends the protocol ACK."""
         message_id = packet["message_id"]
@@ -246,6 +323,14 @@ class MainWindow(QMainWindow):
 
     def _on_send_finished(self, result):
         kind = result[0]
+        if kind == "file_sent":
+            _kind, peer_id, transfer_id, filename, size = result
+            self.store.add_transfer(transfer_id, peer_id, filename, size, "outgoing", "completed")
+            self.statusBar().showMessage(f"File sent and verified by recipient: {filename}", 12000)
+            return
+        if kind == "file_error":
+            self.statusBar().showMessage(f"File transfer failed: {result[2]}", 12000)
+            return
         if len(result) == 2:
             self.statusBar().showMessage(f'Transport error: {result[1]}', 10000)
             return
