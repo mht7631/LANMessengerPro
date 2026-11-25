@@ -6,6 +6,7 @@ if sys.platform != "win32":
 cmd = [
     sys.executable, "-m", "nuitka",
     "--onefile",
+    "--assume-yes-for-downloads",
     "--enable-plugin=pyside6",
     "--windows-console-mode=disable",
     "--output-dir=dist",
