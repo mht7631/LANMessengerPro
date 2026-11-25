@@ -35,7 +35,7 @@ class FileTransferSafetyTests(unittest.TestCase):
             )
             self.assertEqual(output.read_bytes(), payload)
             self.assertEqual(
-                output.relative_to(Path(directory) / "received").resolve().as_posix(),
+                output.relative_to((Path(directory) / "received").resolve()).as_posix(),
                 "sender/source.bin",
             )
 
