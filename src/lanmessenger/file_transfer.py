@@ -179,3 +179,10 @@ def send_file(
     if sent != size:
         raise OSError("source file changed while being transferred")
     return FileEntry(path.name, size, digest.hexdigest())
+
+
+def peer_folder_name(peer_id: str) -> str:
+    """Return a stable filesystem-safe directory name for an untrusted peer identifier."""
+    if not isinstance(peer_id, str) or not peer_id:
+        raise ValueError("peer identifier must be a non-empty string")
+    return hashlib.sha256(peer_id.encode("utf-8")).hexdigest()[:20]
